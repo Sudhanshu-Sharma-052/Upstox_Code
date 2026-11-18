@@ -1,0 +1,275 @@
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upstox Live Index Data</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background: #ffffff;
+            color: #111111;
+        }
+
+        h2 {
+            margin-bottom: 15px;
+        }
+
+        #connectionStatus {
+            padding: 12px;
+            margin-bottom: 15px;
+            background: #f1f1f1;
+            border-radius: 5px;
+        }
+
+        #marketData {
+            padding: 15px;
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            height: 600px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-family: monospace;
+            font-size: 13px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h2>Upstox Live Market Data</h2>
+
+    <div id="connectionStatus">
+        WebSocket: Connecting...
+    </div>
+
+    <h3>Continuous Market Data Feed</h3>
+
+    <pre id="marketData">Waiting for market data...</pre>
+
+
+    <script>
+
+        const dashboardPath = window.location.pathname.match(
+            /\/api\/upstox\/index-data\/dashboard\/([^/]+)\/?$/
+        );
+
+        const userId = dashboardPath
+            ? decodeURIComponent(dashboardPath[1])
+            : "current";
+
+        const backendBaseUrl = "http://127.0.0.1:8000";
+
+        const statusElement =
+            document.getElementById("connectionStatus");
+
+        const marketDataElement =
+            document.getElementById("marketData");
+
+        const latestFeeds = {};
+        const recentMessages = [];
+        const maxRecentMessages = 20;
+        let latestCurrentTs = null;
+
+        let socket = null;
+        let reconnectTimer = null;
+        let pageClosing = false;
+        let feedError = false;
+
+        function connectWebSocket() {
+
+            if (
+                socket &&
+                (
+                    socket.readyState === WebSocket.OPEN ||
+                    socket.readyState === WebSocket.CONNECTING
+                )
+            ) {
+                return;
+            }
+
+            const protocol =
+                window.location.protocol === "https:" ? "wss:" : "ws:";
+
+            const backendHost = dashboardPath
+                ? window.location.host
+                : new URL(backendBaseUrl).host;
+
+            const wsUrl =
+                `${protocol}//${backendHost}` +
+                `/api/upstox/index-data/feed/${encodeURIComponent(userId)}`;
+
+            statusElement.textContent =
+                "WebSocket: Connecting...";
+
+            const currentSocket = new WebSocket(wsUrl);
+
+            socket = currentSocket;
+
+            // WebSocket connection opened
+            currentSocket.onopen = function () {
+
+                statusElement.textContent =
+                    "WebSocket: Connected to Backend";
+            };
+
+            // Receive continuous market data
+            currentSocket.onmessage = function (event) {
+
+                let data;
+
+                try {
+                    data = JSON.parse(event.data);
+                } catch (error) {
+                    console.error("Invalid JSON received:", error);
+                    return;
+                }
+
+                // Connection status
+                if (data.type === "connection") {
+
+                    statusElement.textContent =
+                        "WebSocket: " + data.message;
+
+                    return;
+                }
+
+                // Subscription status
+                if (data.type === "subscription") {
+
+                    statusElement.textContent =
+                        "WebSocket: Connected | " + data.message;
+
+                    return;
+                }
+
+                // Error message
+                if (data.type === "error" || data.success === false) {
+
+                    const errorMessage =
+                        data.message || data.detail || "Market data connection failed.";
+
+                    feedError = true;
+
+                    statusElement.textContent =
+                        "WebSocket Error: " + errorMessage;
+
+                    console.error("Backend error:", data);
+
+                    return;
+                }
+
+                if (data.feeds && typeof data.feeds === "object") {
+                    Object.assign(latestFeeds, data.feeds);
+
+                    latestCurrentTs =
+                        data.currentTs || latestCurrentTs;
+
+                    marketDataElement.textContent =
+                        JSON.stringify({
+                            type: data.type || "live_feed",
+                            feeds: latestFeeds,
+                            currentTs: latestCurrentTs,
+                        }, null, 2);
+
+                    statusElement.textContent =
+                        `WebSocket: Connected | Live indices ` +
+                        `${Object.keys(latestFeeds).length}/6`;
+                } else {
+                    recentMessages.push(data);
+
+                    if (recentMessages.length > maxRecentMessages) {
+                        recentMessages.shift();
+                    }
+
+                    marketDataElement.textContent =
+                        JSON.stringify(recentMessages, null, 2);
+                }
+
+                // Keep latest data visible
+                marketDataElement.scrollTop =
+                    marketDataElement.scrollHeight;
+            };
+
+            // WebSocket error
+            currentSocket.onerror = function (error) {
+
+                console.error("WebSocket error:", error);
+
+                statusElement.textContent =
+                    "WebSocket: Connection Error";
+            };
+
+            // WebSocket disconnected
+            currentSocket.onclose = function () {
+
+                if (socket !== currentSocket) {
+                    return;
+                }
+
+                socket = null;
+
+                if (feedError) {
+                    return;
+                }
+
+                statusElement.textContent =
+                    "WebSocket: Disconnected | Reconnecting...";
+
+                if (!pageClosing && !reconnectTimer) {
+
+                    reconnectTimer = setTimeout(function () {
+
+                        reconnectTimer = null;
+
+                        connectWebSocket();
+
+                    }, 3000);
+                }
+            };
+        }
+
+        window.addEventListener("pagehide", function () {
+
+            pageClosing = true;
+
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
+            if (socket) {
+                const closingSocket = socket;
+                socket = null;
+
+                if (
+                    closingSocket.readyState === WebSocket.OPEN ||
+                    closingSocket.readyState === WebSocket.CONNECTING
+                ) {
+                    closingSocket.close(1000, "Dashboard closed");
+                }
+            }
+        });
+
+        // Route locally opened files through FastAPI so the page can use its
+        // saved login token and the same origin as the WebSocket feed.
+        if (!dashboardPath) {
+            statusElement.textContent =
+                "Opening live dashboard on the local server...";
+            window.location.replace(
+                `${backendBaseUrl}/api/upstox/index-data/dashboard/current`
+            );
+        } else {
+            connectWebSocket();
+        }
+
+    </script>
+
+</body>
+</html>
